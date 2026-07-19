@@ -1,0 +1,7 @@
+python-telegram-bot==22.8
+flask==3.0.2
+python-dotenv==1.0.1
+werkzeug==3.0.1
+httpx==0.28.1
+
+pymongo==4.10.1

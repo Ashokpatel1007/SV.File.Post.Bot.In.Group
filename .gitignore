@@ -1,1 +1,5 @@
 .env
+__pycache__/
+*.pyc
+downloads.sqlite3
+downloads.sqlite3.backup

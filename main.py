@@ -1,67 +1,29 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║       Telegram Media Indexer Bot  —  Production v6.2     ║
+║       Telegram Media Indexer Bot  —  Production v6.4      ║
 ╠══════════════════════════════════════════════════════════╣
-║  Monitors admin posts in a Telegram supergroup and       ║
-║  builds an organised index of media files in a closed    ║
-║  forum topic (ALL_ADDED_SHOWS).                          ║
+║  Monitors admin posts in a Telegram supergroup and        ║
+║  builds an organised index of media files in a closed     ║
+║  forum topic (ALL_ADDED_SHOWS).                            ║
 ╠══════════════════════════════════════════════════════════╣
-║  v6.2 Changes vs v6.1:                                   ║
+║  v6.4 → MongoDB Atlas migration:                          ║
 ║                                                            ║
-║  • FIXED BUG — "missing 1st episode file":               ║
-║    `handle_private_upload` used to run EVERY non-"files"  ║
-║    wizard step (title/languages/qualities/season/topic)   ║
-║    through `_handle_wizard_text`, which pulls its text    ║
-║    from `extract_text(msg)` — and `extract_text()` falls  ║
-║    back to the DOCUMENT'S FILENAME when a message has no  ║
-║    text/caption. If an admin forwarded episode files a    ║
-║    moment before the wizard had advanced to its "files"   ║
-║    step (e.g. right after tapping "Skip"), the very first ║
-║    forwarded file's filename was silently swallowed as    ║
-║    the text answer for whatever step the wizard was still ║
-║    on (season / topic / etc.) — corrupting that field AND ║
-║    dropping that first file entirely, since it was never  ║
-║    stored as an episode asset. Fixed by checking whether  ║
-║    the incoming message actually carries a file BEFORE     ║
-║    routing to the text handler: if it does, and the       ║
-║    wizard isn't on the "files" step yet, the admin is     ║
-║    told to finish the current step first — the file is    ║
-║    never silently consumed as text.                       ║
-║                                                            ║
-║  • RELIES ONLY ON "Upload Complete" — never on filenames:  ║
-║    the fix above also guarantees that filenames are NEVER  ║
-║    used to decide wizard flow/state. Series episode        ║
-║    bundling was always token-based (not filename-based),   ║
-║    but the routing bug above could make it *look* like     ║
-║    the bot was "reading" filenames. That illusion is gone. ║
-║                                                            ║
-║  • MULTI-SEASON SERIES SUPPORT: the wizard now asks        ║
-║    "Send total seasons" (comma separated, e.g.             ║
-║    "S01, S02, S03" — or just "S01") the same way it asks   ║
-║    for languages/qualities. Numbers like "1, 2, 3" are     ║
-║    also accepted and normalised to "S01, S02, S03".        ║
-║    Files are then requested per-season, per-quality        ║
-║    (e.g. "Forward episode files for S01 720p."), and       ║
-║    after each "Upload Complete" the wizard automatically   ║
-║    moves to the next quality, then the next season, until  ║
-║    everything is collected. The final post gets one        ║
-║    button PER SEASON ("S01", "S02", …) plus a combined     ║
-║    "ALL SEASONS" button. (Movie mode is completely         ║
-║    unaffected — same per-quality buttons + "SEND ALL".)    ║
-║                                                            ║
-║  • AUTO CROSS-POST TO ALL_ADDED_SHOWS: whenever /makepost  ║
-║    publishes a post into a topic OTHER than                ║
-║    ALL_ADDED_SHOWS (topic id 3, "SEARCH ALL ADDED SHOWS"), ║
-║    the bot now automatically makes a second, mirror post   ║
-║    inside ALL_ADDED_SHOWS with the same title/language/    ║
-║    quality (or season) text, but with a SINGLE button that ║
-║    deep-links straight to the original post the bot just   ║
-║    made in its chosen topic. No manual re-posting needed.  ║
-║                                                            ║
-║  Everything else is unchanged from v6.1 (closed-topic      ║
-║  auto reopen/close, admin-only commands, welcome flow,     ║
-║  link delivery, topic-name normalisation, HTML-escaped     ║
-║  join names, Pylance-clean callback replies, etc.).        ║
+║  • The link/bundle store (previously SQLite) is now       ║
+║    backed by MongoDB Atlas via `pymongo`. Two collections  ║
+║    are used in the configured database:                    ║
+║      - "downloads"  → one document per uploaded file       ║
+║      - "bundles"    → one document per quality/season/     ║
+║                        sendall bundle (child_tokens is a    ║
+║                        native array, no more JSON strings)  ║
+║  • Required .env keys: MONGODB_URI, MONGODB_DB_NAME         ║
+║  • init_link_store() connects + pings the cluster at        ║
+║    startup and raises immediately if the connection fails,  ║
+║    instead of failing silently on first upload.             ║
+║  • All read/write helper functions keep their EXACT same    ║
+║    names and signatures (_store_download, _get_download,    ║
+║    _increment_download_count, _store_bundle, _get_bundle,   ║
+║    _increment_bundle_count) so nothing else in the bot      ║
+║    (wizard, redemption, delivery) needed to change.          ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Required .env keys:                                     ║
 ║    BOT_TOKEN         — Telegram bot token                ║
@@ -72,6 +34,8 @@
 ║                        into (currently id 1, the built-  ║
 ║                        in "# General" topic)             ║
 ║    ADMIN_IDS         — Comma-separated admin user IDs    ║
+║    MONGODB_URI       — MongoDB Atlas connection string   ║
+║    MONGODB_DB_NAME   — MongoDB database name             ║
 ║                                                          ║
 ║  Optional .env keys (with defaults):                     ║
 ║    IGNORED_TOPICS    — Comma-separated forum topic IDs   ║
@@ -100,7 +64,8 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
+from pymongo import MongoClient
+from pymongo.collection import Collection
 import threading
 import time
 import json
@@ -222,6 +187,7 @@ for _ln in (
     "telegram",
     "telegram.ext",
     "telegram.request",
+    "pymongo",
 ):
     logging.getLogger(_ln).addFilter(_redact)
     logging.getLogger(_ln).setLevel(logging.WARNING)
@@ -323,7 +289,8 @@ class Config:
 
     # ── Link delivery / redemption ────────────────────────
     BOT_USERNAME:      str       = field(default_factory=lambda: _env("BOT_USERNAME", ""))
-    DATABASE_PATH:     str       = field(default_factory=lambda: _env("DATABASE_PATH", "downloads.sqlite3"))
+    MONGODB_URI:       str       = field(default_factory=lambda: _env("MONGODB_URI"))
+    MONGODB_DB_NAME:   str       = field(default_factory=lambda: _env("MONGODB_DB_NAME", "StreamVerseOG"))
     GPLINKS_API_KEY:   str       = field(default_factory=lambda: _env("GPLINKS_API_KEY", ""))
     GPLINKS_API_URL:   str       = field(default_factory=lambda: _env("GPLINKS_API_URL", "https://api.gplinks.com/api"))
     TOPIC_MAP:         str       = field(default_factory=lambda: _env("TOPIC_MAP", ""))
@@ -502,167 +469,179 @@ zip_cache  = TTLCache(ttl=CFG.SEEN_TTL_SEC)   # track if zip hint already shown
 
 
 # ──────────────────────────────────────────────────────────
-#  LINK STORE (SQLite)
+#  LINK STORE (MongoDB / Atlas)
+#
+#  Two collections in the configured database:
+#    "downloads" → one document per uploaded file
+#      { token, file_id, file_type, file_name, caption,
+#        deep_link, short_url, source_chat_id,
+#        source_message_id, created_at, downloads_count }
+#    "bundles"   → one document per quality/season/sendall bundle
+#      { token, label, kind, child_tokens: [...], deep_link,
+#        short_url, source_chat_id, source_message_id,
+#        created_at, downloads_count }
+#
+#  child_tokens is stored as a native Mongo array (no more manual
+#  json.dumps/json.loads round-tripping like the old SQLite store).
 # ──────────────────────────────────────────────────────────
-def _db_path() -> str:
-    path = CFG.DATABASE_PATH.strip() or "downloads.sqlite3"
-    return path
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.database import Database
+
+_mongo_client: MongoClient | None = None
+_mongo_db: Database | None = None
+_downloads_col: Collection | None = None
+_bundles_col: Collection | None = None
+
+def _downloads_collection() -> Collection:
+    if _downloads_col is None:
+        raise RuntimeError("MongoDB downloads collection is not initialized.")
+    return _downloads_col
 
 
-def _db_connect() -> sqlite3.Connection:
-    path = _db_path()
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _bundles_collection() -> Collection:
+    if _bundles_col is None:
+        raise RuntimeError("MongoDB bundles collection is not initialized.")
+    return _bundles_col
 
 
 def init_link_store() -> None:
-    with _DB_LOCK:
-        with _db_connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS downloads (
-                    token TEXT PRIMARY KEY,
-                    file_id TEXT NOT NULL,
-                    file_type TEXT NOT NULL,
-                    file_name TEXT,
-                    caption TEXT,
-                    deep_link TEXT NOT NULL,
-                    short_url TEXT,
-                    source_chat_id INTEGER,
-                    source_message_id INTEGER,
-                    created_at REAL NOT NULL,
-                    downloads_count INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bundles (
-                    token TEXT PRIMARY KEY,
-                    label TEXT,
-                    kind TEXT NOT NULL,
-                    child_tokens TEXT NOT NULL,
-                    deep_link TEXT NOT NULL,
-                    short_url TEXT,
-                    source_chat_id INTEGER,
-                    source_message_id INTEGER,
-                    created_at REAL NOT NULL,
-                    downloads_count INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_downloads_short_url ON downloads(short_url)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_bundles_short_url ON bundles(short_url)"
-            )
-            conn.commit()
+    """
+    Connect to MongoDB Atlas (CFG.MONGODB_URI / CFG.MONGODB_DB_NAME) and
+    ensure the required indexes exist. Called once from on_startup().
+    """
+    global _mongo_client, _mongo_db, _downloads_col, _bundles_col
+
+    client = MongoClient(CFG.MONGODB_URI, serverSelectionTimeoutMS=10_000)
+    client.admin.command("ping")
+
+    db = client[CFG.MONGODB_DB_NAME]
+    downloads_col = db["downloads"]
+    bundles_col = db["bundles"]
+
+    downloads_col.create_index("token", unique=True)
+    bundles_col.create_index("token", unique=True)
+
+    _mongo_client = client
+    _mongo_db = db
+    _downloads_col = downloads_col
+    _bundles_col = bundles_col
+
+    log.info(
+        f"[MONGO] Connected — db={CFG.MONGODB_DB_NAME!r} "
+        f"(downloads={downloads_col.estimated_document_count()}, "
+        f"bundles={bundles_col.estimated_document_count()})"
+    )
 
 
 def _store_download(record: dict) -> None:
+    col = _downloads_collection()
+
+    document = {
+        "token": record["token"],
+        "file_id": record["file_id"],
+        "file_type": record["file_type"],
+        "file_name": record.get("file_name", ""),
+        "caption": record.get("caption", ""),
+        "deep_link": record["deep_link"],
+        "short_url": record.get("short_url", ""),
+        "source_chat_id": record.get("source_chat_id"),
+        "source_message_id": record.get("source_message_id"),
+        "created_at": record.get("created_at", time.time()),
+        "downloads_count": record.get("downloads_count", 0),
+    }
+
     with _DB_LOCK:
-        with _db_connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO downloads (
-                    token, file_id, file_type, file_name, caption, deep_link,
-                    short_url, source_chat_id, source_message_id, created_at,
-                    downloads_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record["token"],
-                    record["file_id"],
-                    record["file_type"],
-                    record.get("file_name", ""),
-                    record.get("caption", ""),
-                    record["deep_link"],
-                    record.get("short_url", ""),
-                    record.get("source_chat_id"),
-                    record.get("source_message_id"),
-                    record.get("created_at", time.time()),
-                    record.get("downloads_count", 0),
-                ),
+        existing = col.find_one({"token": document["token"]})
+
+        if existing:
+            same_record = (
+                existing.get("file_id") == document["file_id"]
+                and existing.get("file_type") == document["file_type"]
+                and existing.get("deep_link") == document["deep_link"]
             )
-            conn.commit()
+
+            if not same_record:
+                log.error(
+                    "[TOKEN COLLISION] Token %s already belongs to another file. Refusing overwrite.",
+                    record["token"],
+                )
+                return
+
+        col.replace_one(
+            {"token": document["token"]},
+            document,
+            upsert=True,
+        )
 
 
 def _get_download(token: str) -> Optional[dict]:
+    col = _downloads_collection()
     with _DB_LOCK:
-        with _db_connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM downloads WHERE token = ?",
-                (token,),
-            ).fetchone()
-            return dict(row) if row else None
+        return col.find_one({"token": token}, {"_id": 0})
 
 
 def _increment_download_count(token: str) -> None:
+    col = _downloads_collection()
     with _DB_LOCK:
-        with _db_connect() as conn:
-            conn.execute(
-                "UPDATE downloads SET downloads_count = downloads_count + 1 WHERE token = ?",
-                (token,),
-            )
-            conn.commit()
+        col.update_one({"token": token}, {"$inc": {"downloads_count": 1}})
 
 
 def _store_bundle(record: dict) -> None:
+    col = _bundles_collection()
+
+    document = {
+        "token": record["token"],
+        "label": record.get("label", ""),
+        "kind": record.get("kind", "bundle"),
+        "child_tokens": record.get("child_tokens", []),
+        "deep_link": record["deep_link"],
+        "short_url": record.get("short_url", ""),
+        "source_chat_id": record.get("source_chat_id"),
+        "source_message_id": record.get("source_message_id"),
+        "created_at": record.get("created_at", time.time()),
+        "downloads_count": record.get("downloads_count", 0),
+    }
+
     with _DB_LOCK:
-        with _db_connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO bundles (
-                    token, label, kind, child_tokens, deep_link, short_url,
-                    source_chat_id, source_message_id, created_at, downloads_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record["token"],
-                    record.get("label", ""),
-                    record.get("kind", "bundle"),
-                    json.dumps(record.get("child_tokens", [])),
-                    record["deep_link"],
-                    record.get("short_url", ""),
-                    record.get("source_chat_id"),
-                    record.get("source_message_id"),
-                    record.get("created_at", time.time()),
-                    record.get("downloads_count", 0),
-                ),
+        existing = col.find_one({"token": document["token"]})
+
+        if existing:
+            same_record = (
+                existing.get("label") == document["label"]
+                and existing.get("kind") == document["kind"]
+                and existing.get("child_tokens") == document["child_tokens"]
             )
-            conn.commit()
+
+            if not same_record:
+                log.error(
+                    "[TOKEN COLLISION] Bundle token %s already belongs to another bundle. Refusing overwrite.",
+                    document["token"],
+                )
+                return
+
+        col.replace_one(
+            {"token": document["token"]},
+            document,
+            upsert=True,
+        )
 
 
 def _get_bundle(token: str) -> Optional[dict]:
+    col = _bundles_collection()
     with _DB_LOCK:
-        with _db_connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM bundles WHERE token = ?",
-                (token,),
-            ).fetchone()
-            if not row:
-                return None
-            data = dict(row)
-            try:
-                data["child_tokens"] = json.loads(data.get("child_tokens") or "[]")
-            except Exception:
-                data["child_tokens"] = []
-            return data
+        doc = col.find_one({"token": token}, {"_id": 0})
+        if not doc:
+            return None
+        if not isinstance(doc.get("child_tokens"), list):
+            doc["child_tokens"] = []
+        return doc
 
 
 def _increment_bundle_count(token: str) -> None:
+    col = _bundles_collection()
     with _DB_LOCK:
-        with _db_connect() as conn:
-            conn.execute(
-                "UPDATE bundles SET downloads_count = downloads_count + 1 WHERE token = ?",
-                (token,),
-            )
-            conn.commit()
+        col.update_one({"token": token}, {"$inc": {"downloads_count": 1}})
 
 
 # ──────────────────────────────────────────────────────────
@@ -3281,6 +3260,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  forward it to Saved Messages first — preview with /testdeletemessage\n"
         f"• Ignored topics (never indexed): {sorted(CFG.IGNORED_TOPICS) or 'none'}\n"
         f"• All commands are admin-only and hidden from regular users\n"
+        f"• Link/bundle storage now runs on MongoDB Atlas (persistent)\n"
         f"• Bot token is NEVER revealed in logs",
         parse_mode=ParseMode.HTML,
     )
@@ -3346,8 +3326,9 @@ async def flush_loop(tg_app: Application) -> None:
 async def on_startup(tg_app: Application) -> None:
     """
     1. Initialise shared asyncio lock.
-    2. Register admin command scopes (hides commands from regular users).
-    3. Start the background flush loop.
+    2. Connect to MongoDB Atlas (raises + aborts startup on failure).
+    3. Register admin command scopes (hides commands from regular users).
+    4. Start the background flush loop.
     """
     global _pending_lock, _BOT_USERNAME
     _pending_lock = asyncio.Lock()
@@ -3362,7 +3343,18 @@ async def on_startup(tg_app: Application) -> None:
         except Exception as exc:
             log.warning(f"Could not resolve bot username: {exc}")
 
-    init_link_store()
+    # ── Connect to MongoDB Atlas — fail loudly, don't start half-broken ──
+    try:
+        init_link_store()
+    except Exception as exc:
+        log.critical(
+            f"[MONGO] Could not connect to MongoDB Atlas — bot cannot start "
+            f"without persistent link storage. Check MONGODB_URI / "
+            f"MONGODB_DB_NAME in .env, your Atlas IP whitelist (Network "
+            f"Access → Add current IP / 0.0.0.0/0 for testing), and your "
+            f"cluster's user credentials. Error: {exc}"
+        )
+        raise
 
     # ── Register admin command scopes ──────────────────────────────────
     # Strategy:
@@ -3427,8 +3419,9 @@ async def on_startup(tg_app: Application) -> None:
     log.info(f"  Debounce:    {CFG.DEBOUNCE_SEC}s")
     log.info(f"  SeenTTL:     {CFG.SEEN_TTL_SEC}s")
     log.info(f"  DeleteDelay: {CFG.DELETE_DELAY_SEC}s")
+    log.info(f"  MongoDB:     {CFG.MONGODB_DB_NAME} (connected)")
     log.info("  Token:       ***REDACTED***")
-    log.info("  Mode:        v6.4 (poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands)")
+    log.info("  Mode:        v6.4 (MongoDB Atlas persistent store · poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands)")
     log.info("══════════════════════════════════════════════")
 
     asyncio.create_task(flush_loop(tg_app), name="flush_loop")
@@ -3491,4 +3484,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()                                                                                                                                                                  
+    main()

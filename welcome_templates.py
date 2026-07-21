@@ -26,7 +26,7 @@ WELCOME_BUTTON_LABEL = "💬 Go to Chat"
 # ──────────────────────────────────────────────────────────
 
 DELETE_WARNING_TEMPLATE_HTML = (
-    "👋 Hello <b>{name}</b>,\n"
+    "👋 Hello <b>{name}</b>,\n\n"
     "Please Forward this file to your personal chat like saved message or any other group\n\n"
 
     "<b>Because This File will be Auto Deleted after\n\n</b> "

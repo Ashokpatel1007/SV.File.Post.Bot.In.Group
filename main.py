@@ -1291,9 +1291,10 @@ def make_topic_msg_link(chat_id: int, thread_id: int, message_id: int) -> str:
 #      Without this, _send_to_closed_topic will fail and log
 #      a clear error message telling you exactly what to fix.
 # ──────────────────────────────────────────────────────────
-async def _send_to_closed_topic(bot: Bot, **kwargs) -> Optional[Message]:
+async def _send_to_closed_topic(bot: Bot, method: str, **kwargs) -> Optional[Message]:
     """
-    Temporarily reopen a closed forum topic, send a message, then close it again.
+    Temporarily reopen a closed forum topic, send a message (or photo, if
+    method="send_photo"), then close it again.
 
     Receives the full kwargs dict (same one passed to safe_send) so there
     is no risk of passing chat_id / message_thread_id twice.
@@ -1327,10 +1328,11 @@ async def _send_to_closed_topic(bot: Bot, **kwargs) -> Optional[Message]:
     # Step 2 — Send (full kwargs already has chat_id + message_thread_id)
     sent: Optional[Message] = None
     try:
-        sent = await bot.send_message(**kwargs)
+        send_fn = getattr(bot, method)
+        sent = await send_fn(**kwargs)
         log.debug(f"[TOPIC] Message sent to previously-closed topic {thread_id}")
     except TelegramError as exc:
-        log.error(f"[TOPIC-CLOSED] send_message failed after reopen: {exc}")
+        log.error(f"[TOPIC-CLOSED] {method} failed after reopen: {exc}")
         stats.inc("errors")
 
     # Step 3 — Re-close (always attempt, even if send failed)
@@ -1346,9 +1348,10 @@ async def _send_to_closed_topic(bot: Bot, **kwargs) -> Optional[Message]:
 # ──────────────────────────────────────────────────────────
 #  SAFE SEND  (auto-retry + closed-topic support)
 # ──────────────────────────────────────────────────────────
-async def safe_send(bot: Bot, **kwargs) -> Optional[Message]:
+async def safe_send(bot: Bot, *, method: str = "send_message", **kwargs) -> Optional[Message]:
     """
-    Send a Telegram message with up to 4 retries on rate limits.
+    Send a Telegram message (or photo, when method="send_photo") with up to
+    4 retries on rate limits.
 
     Closed-topic handling:
         If the target thread raises Topic_closed, calls _send_to_closed_topic
@@ -1357,10 +1360,11 @@ async def safe_send(bot: Bot, **kwargs) -> Optional[Message]:
     """
     chat_id   = kwargs.get("chat_id")
     thread_id = kwargs.get("message_thread_id")
+    send_fn   = getattr(bot, method)
 
     for attempt in range(4):
         try:
-            return await bot.send_message(**kwargs)
+            return await send_fn(**kwargs)
 
         except RetryAfter as e:
             wait = (
@@ -1382,7 +1386,7 @@ async def safe_send(bot: Bot, **kwargs) -> Optional[Message]:
                 )
                 # Pass the FULL kwargs — _send_to_closed_topic extracts
                 # chat_id and thread_id from it internally, so no duplication.
-                return await _send_to_closed_topic(bot, **kwargs)
+                return await _send_to_closed_topic(bot, method, **kwargs)
 
             log.error(f"BadRequest: {e}")
             stats.inc("errors")
@@ -1776,6 +1780,15 @@ class PostDraft:
     languages: List[str] = field(default_factory=list)
     qualities: List[str] = field(default_factory=list)
 
+    # ── Poster image (v6.4) ─────────────────────────────────────────────
+    # Asked right after Movie/Series mode is chosen, before the title.
+    # Stored as a raw Telegram file_id so the final post can be sent via
+    # send_photo(photo=poster_file_id, caption=...) instead of send_message.
+    # Only "photo" type is accepted (see `_handle_wizard_poster`) — a
+    # send_photo call requires a file_id that was itself uploaded as a
+    # photo; reusing a "document" file_id there would fail.
+    poster_file_id: Optional[str] = None
+
     # ── Series-only: multi-season support (v6.2) ───────────────────────
     # `seasons` holds normalised labels like ["S01", "S02", "S03"].
     # `current_season_index` walks through `seasons` the same way
@@ -1911,6 +1924,7 @@ def _preview_keyboard() -> InlineKeyboardMarkup:
 
 def _edit_keyboard(draft: "PostDraft") -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton("Poster", callback_data="mp:edit:poster")],
         [InlineKeyboardButton("Title", callback_data="mp:edit:title")],
         [InlineKeyboardButton("Languages", callback_data="mp:edit:languages")],
         [InlineKeyboardButton("Qualities", callback_data="mp:edit:qualities")],
@@ -1924,22 +1938,35 @@ def _edit_keyboard(draft: "PostDraft") -> InlineKeyboardMarkup:
 
 
 def _wizard_post_text(draft: PostDraft) -> str:
-    lines = [draft.title or "Untitled"]
+    """
+    Build the final published post's text (also used as the caption when a
+    poster image is attached). Labelled, one field per line:
+
+        Title: Dastaar 2026
+        Languages: Punjabi
+        Quality: 720p
+
+    All dynamic values are HTML-escaped — titles/languages/qualities are
+    free-typed admin input and this text is sent with parse_mode=HTML, so an
+    unescaped "<" or "&" would silently break the post (same class of bug
+    fixed earlier for join names).
+    """
+    lines = [f"<b>Title:</b> {html_escape(draft.title or 'Untitled')}"]
     if draft.languages:
-        lines.append(", ".join(draft.languages))
+        lines.append(f"<b>Languages:</b> {html_escape(', '.join(draft.languages))}")
     if draft.mode == "series" and draft.seasons:
-        lines.append(", ".join(draft.seasons))
+        lines.append(f"<b>Seasons:</b> {html_escape(', '.join(draft.seasons))}")
     if draft.qualities:
         if draft.mode == "series":
             # Series posts show the plain requested quality list — the
             # per-episode bundles live behind the season buttons instead.
-            lines.append(", ".join(draft.qualities))
+            lines.append(f"<b>Quality:</b> {html_escape(', '.join(draft.qualities))}")
         else:
             quality_labels = []
             for q in draft.qualities:
                 asset = draft.quality_assets.get(q)
                 quality_labels.append(asset.label if asset else q)
-            lines.append(", ".join(quality_labels))
+            lines.append(f"<b>Quality:</b> {html_escape(', '.join(quality_labels))}")
     return "\n".join(lines)
 
 
@@ -2143,6 +2170,7 @@ def _draft_preview(draft: PostDraft) -> str:
             quality_lines.append(q)
     lines = [
         "📝  <b>Preview</b>",
+        f"Poster: <b>{'✅ Attached' if draft.poster_file_id else '— (none)'}</b>",
         f"Title: <b>{html_escape(draft.title or 'Untitled')}</b>",
         f"Languages: <b>{html_escape(', '.join(draft.languages) if draft.languages else '—')}</b>",
     ]
@@ -2156,6 +2184,8 @@ def _draft_preview(draft: PostDraft) -> str:
 def _current_prompt(draft: PostDraft) -> str:
     if draft.step == "mode":
         return "Choose post type:"
+    if draft.step == "poster":
+        return "📸 Forward the poster image (or tap Skip):"
     if draft.step == "title":
         return "Send the title:"
     if draft.step == "languages":
@@ -2173,6 +2203,8 @@ def _current_prompt(draft: PostDraft) -> str:
         return "Choose the topic to post in:"
     if draft.step == "preview":
         return _draft_preview(draft)
+    if draft.step == "edit_poster":
+        return "Forward a new poster image, or tap Skip to remove the poster:"
     if draft.step.startswith("edit_"):
         return "Send the updated value:"
     return "Continue:"
@@ -2181,6 +2213,16 @@ def _current_prompt(draft: PostDraft) -> str:
 async def _send_wizard_prompt(bot: Bot, draft: PostDraft) -> None:
     if draft.step == "mode":
         await bot.send_message(chat_id=draft.chat_id, text="Choose post type:", reply_markup=_mode_keyboard())
+        return
+    if draft.step == "poster":
+        await bot.send_message(
+            chat_id=draft.chat_id,
+            text="📸 Forward the poster image for this post (or tap Skip):",
+            reply_markup=_simple_skip_keyboard("poster"),
+        )
+        return
+    if draft.step == "title":
+        await bot.send_message(chat_id=draft.chat_id, text="Send the title:")
         return
     if draft.step == "languages":
         await bot.send_message(chat_id=draft.chat_id, text="Send languages (comma separated) or skip:", reply_markup=_simple_skip_keyboard("languages"))
@@ -2208,7 +2250,16 @@ async def _send_wizard_prompt(bot: Bot, draft: PostDraft) -> None:
         await bot.send_message(chat_id=draft.chat_id, text="Choose the topic to post in:", reply_markup=_topic_buttons())
         return
     if draft.step == "preview":
-        await bot.send_message(chat_id=draft.chat_id, text=_draft_preview(draft), parse_mode=ParseMode.HTML, reply_markup=_preview_keyboard())
+        if draft.poster_file_id:
+            await bot.send_photo(
+                chat_id=draft.chat_id,
+                photo=draft.poster_file_id,
+                caption=_draft_preview(draft),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_preview_keyboard(),
+            )
+        else:
+            await bot.send_message(chat_id=draft.chat_id, text=_draft_preview(draft), parse_mode=ParseMode.HTML, reply_markup=_preview_keyboard())
         return
     if draft.step.startswith("edit_"):
         await bot.send_message(chat_id=draft.chat_id, text=_current_prompt(draft))
@@ -2314,14 +2365,27 @@ async def _publish_draft_to_group(context: ContextTypes.DEFAULT_TYPE, draft: Pos
         buttons.append([InlineKeyboardButton("SEND ALL", url=draft.send_all_asset.short_url)])
 
     text = _wizard_post_text(draft)
-    sent = await safe_send(
-        context.application.bot,
-        chat_id=CFG.GROUP_CHAT_ID,
-        message_thread_id=draft.topic_id,
-        text=text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=ParseMode.HTML,
-    )
+
+    if draft.poster_file_id:
+        sent = await safe_send(
+            context.application.bot,
+            method="send_photo",
+            chat_id=CFG.GROUP_CHAT_ID,
+            message_thread_id=draft.topic_id,
+            photo=draft.poster_file_id,
+            caption=text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        sent = await safe_send(
+            context.application.bot,
+            chat_id=CFG.GROUP_CHAT_ID,
+            message_thread_id=draft.topic_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
     return sent
 
 
@@ -2330,9 +2394,10 @@ async def _crosspost_to_all_added_shows(context: ContextTypes.DEFAULT_TYPE, draf
     v6.2: after a wizard post is published into the admin's CHOSEN topic,
     automatically mirror it into ALL_ADDED_SHOWS (topic id = CFG.ALL_ADDED_SHOWS,
     "SEARCH ALL ADDED SHOWS") with the same title/language/quality-or-season
-    text, but with a SINGLE button that deep-links straight to the original
-    post the bot just made. Skipped when the chosen topic already IS
-    ALL_ADDED_SHOWS, to avoid posting the exact same thing twice.
+    text (and poster, if one was attached), but with a SINGLE button that
+    deep-links straight to the original post the bot just made. Skipped when
+    the chosen topic already IS ALL_ADDED_SHOWS, to avoid posting the exact
+    same thing twice.
     """
     if draft.topic_id is None or draft.topic_id == CFG.ALL_ADDED_SHOWS:
         return
@@ -2342,14 +2407,26 @@ async def _crosspost_to_all_added_shows(context: ContextTypes.DEFAULT_TYPE, draf
     buttons = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=link)]])
     text = _wizard_post_text(draft)
 
-    sent = await safe_send(
-        context.application.bot,
-        chat_id=CFG.GROUP_CHAT_ID,
-        message_thread_id=CFG.ALL_ADDED_SHOWS,
-        text=text,
-        reply_markup=buttons,
-        parse_mode=ParseMode.HTML,
-    )
+    if draft.poster_file_id:
+        sent = await safe_send(
+            context.application.bot,
+            method="send_photo",
+            chat_id=CFG.GROUP_CHAT_ID,
+            message_thread_id=CFG.ALL_ADDED_SHOWS,
+            photo=draft.poster_file_id,
+            caption=text,
+            reply_markup=buttons,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        sent = await safe_send(
+            context.application.bot,
+            chat_id=CFG.GROUP_CHAT_ID,
+            message_thread_id=CFG.ALL_ADDED_SHOWS,
+            text=text,
+            reply_markup=buttons,
+            parse_mode=ParseMode.HTML,
+        )
     if sent:
         log.info(
             f"[CROSSPOST] mirrored post {original.message_id!r} "
@@ -2365,12 +2442,22 @@ async def _crosspost_to_all_added_shows(context: ContextTypes.DEFAULT_TYPE, draf
 async def _finalize_and_show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, draft: PostDraft) -> None:
     draft.send_all_asset = await _finalize_send_all_bundle(update, context, draft)
     draft.step = "preview"
-    await context.application.bot.send_message(
-        chat_id=draft.chat_id,
-        text=_draft_preview(draft),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_preview_keyboard(),
-    )
+    preview_text = _draft_preview(draft)
+    if draft.poster_file_id:
+        await context.application.bot.send_photo(
+            chat_id=draft.chat_id,
+            photo=draft.poster_file_id,
+            caption=preview_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_preview_keyboard(),
+        )
+    else:
+        await context.application.bot.send_message(
+            chat_id=draft.chat_id,
+            text=preview_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_preview_keyboard(),
+        )
 
 
 async def _handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE, draft: PostDraft) -> bool:
@@ -2449,6 +2536,35 @@ async def _handle_wizard_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _finalize_and_show_preview(update, context, draft)
         return True
     return False
+
+
+async def _handle_wizard_poster(update: Update, context: ContextTypes.DEFAULT_TYPE, draft: PostDraft, payload: dict) -> None:
+    """
+    Save the forwarded poster image onto the draft. Only accepts payloads
+    Telegram uploaded as an actual photo (compressed image) — a Telegram
+    file_id can only be resent via the SAME api method it came from, so a
+    "document" (uncompressed image sent as a file) file_id would fail if
+    later passed to send_photo(). Rejecting non-photo types up front avoids
+    that failure mode entirely rather than surfacing a cryptic Telegram
+    error at publish time.
+    """
+    if payload.get("file_type") != "photo":
+        await context.application.bot.send_message(
+            chat_id=draft.chat_id,
+            text="That doesn't look like a photo. Please send the poster as a photo (not a file), or tap Skip above.",
+        )
+        return
+
+    is_edit = draft.step == "edit_poster"
+    draft.poster_file_id = payload["file_id"]
+
+    if is_edit:
+        await context.application.bot.send_message(chat_id=draft.chat_id, text="✅ Poster updated.")
+        await _finalize_and_show_preview(update, context, draft)
+    else:
+        draft.step = "title"
+        await context.application.bot.send_message(chat_id=draft.chat_id, text="✅ Poster saved.")
+        await _send_wizard_prompt(context.application.bot, draft)
 
 
 async def _handle_wizard_file(update: Update, context: ContextTypes.DEFAULT_TYPE, draft: PostDraft, payload: dict) -> bool:
@@ -2572,11 +2688,14 @@ async def _handle_wizard_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "mode":
         draft.mode = value
-        draft.step = "title"
-        await _wizard_reply(update, context, "Send the title:")
+        draft.step = "poster"
+        await _send_wizard_prompt(context.application.bot, draft)
         return True
     if action == "skip":
-        if value == "languages":
+        if value == "poster":
+            draft.poster_file_id = None
+            draft.step = "title"
+        elif value == "languages":
             draft.languages = []
             draft.step = "qualities"
         elif value == "qualities":
@@ -2588,6 +2707,10 @@ async def _handle_wizard_callback(update: Update, context: ContextTypes.DEFAULT_
         elif value == "seasons":
             draft.seasons = ["S01"]
             _start_season_flow(draft)
+        elif value == "edit_poster":
+            draft.poster_file_id = None
+            await _finalize_and_show_preview(update, context, draft)
+            return True
         elif value == "topic":
             draft.topic_id = CFG.ALL_ADDED_SHOWS
             draft.topic_name = _topic_name_by_id(CFG.ALL_ADDED_SHOWS)
@@ -2627,7 +2750,14 @@ async def _handle_wizard_callback(update: Update, context: ContextTypes.DEFAULT_
             await _finalize_and_show_preview(update, context, draft)
             return True
         draft.step = f"edit_{value}"
-        await _wizard_reply(update, context, _current_prompt(draft))
+        if value == "poster":
+            await _wizard_reply(
+                update, context,
+                "Forward a new poster image, or tap Skip to remove the poster:",
+                reply_markup=_simple_skip_keyboard("edit_poster"),
+            )
+        else:
+            await _wizard_reply(update, context, _current_prompt(draft))
         return True
     if action == "cancel":
         _clear_draft(user.id)
@@ -2681,6 +2811,9 @@ async def handle_private_upload(update: Update, context: ContextTypes.DEFAULT_TY
        also guarantees filenames are NEVER used to drive wizard state —
        only the explicit "Upload Complete" button press does that.
 
+       (v6.4): the new "poster" / "edit_poster" steps get the same
+       file-vs-text routing treatment, via their own dedicated branch.
+
     2. STANDALONE QUICK-LINK UPLOAD — with no active draft, any forwarded/
        uploaded file from an admin gets turned into a single GPLinks deep
        link (unchanged legacy behaviour).
@@ -2697,6 +2830,16 @@ async def handle_private_upload(update: Update, context: ContextTypes.DEFAULT_TY
     draft = _get_draft(user.id)
     if draft is not None:
         payload = _supported_private_payload(msg)
+
+        if draft.step in ("poster", "edit_poster"):
+            if payload:
+                await _handle_wizard_poster(update, context, draft, payload)
+            else:
+                await context.application.bot.send_message(
+                    chat_id=chat.id,
+                    text="Please forward the poster image, or tap Skip above to continue.",
+                )
+            return
 
         if draft.step == "files":
             if payload:
@@ -2954,7 +3097,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     s = stats.snapshot()
     await msg.reply_text(
-        f"📊  <b>Bot Status — v6.3</b>\n"
+        f"📊  <b>Bot Status — v6.4</b>\n"
         f"{_CMD_SEP}\n"
         f"🎬  Indexed:         <b>{s['indexed']}</b>\n"
         f"📦  ZIP hints:       <b>{s['zip_hints']}</b>\n"
@@ -3057,7 +3200,7 @@ async def cmd_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @_admin_only
 async def cmd_testdeletemessage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /testdeletemessage  (v6.3, admin-only, DM or group)
+    /testdeletemessage  (admin-only, DM or group)
 
     Lets an admin preview EXACTLY what a member sees after redeeming a file
     or bundle — using the admin's own name — without touching any real
@@ -3070,12 +3213,6 @@ async def cmd_testdeletemessage(update: Update, context: ContextTypes.DEFAULT_TY
     Nothing in the group or any member's chat is touched — every message
     this command sends/deletes lives only in the chat where /testdeletemessage
     was run.
-
-    To change the wording: edit DELETE_WARNING_TEMPLATE_HTML /
-    GROUP_FOOTER_TEMPLATE_HTML in welcome_templates.py, or GROUP_NAME /
-    GROUP_JOIN_LINK / DELETE_DELAY_SEC in .env — then re-run this command
-    to see the result, no restart needed for the .env values already loaded
-    at startup (a bot restart IS needed after changing .env though).
     """
     msg = update.message
     user = update.effective_user
@@ -3086,12 +3223,7 @@ async def cmd_testdeletemessage(update: Update, context: ContextTypes.DEFAULT_TY
 
     await msg.reply_text(
         "🧪  <b>Preview mode</b> — this is exactly what a member sees after "
-        "redeeming a file or bundle (shown here with YOUR name). Edit "
-        "<code>DELETE_WARNING_TEMPLATE_HTML</code> / "
-        "<code>GROUP_FOOTER_TEMPLATE_HTML</code> in "
-        "<code>welcome_templates.py</code>, or <code>GROUP_NAME</code> / "
-        "<code>GROUP_JOIN_LINK</code> / <code>DELETE_DELAY_SEC</code> in "
-        "<code>.env</code>, then run <code>/testdeletemessage</code> again.",
+        "redeeming a file or bundle (shown here with YOUR name).",
         parse_mode=ParseMode.HTML,
     )
     await msg.reply_text(preview_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -3114,7 +3246,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg:
         return
     await msg.reply_text(
-        f"🤖  <b>Media Indexer Bot v6.3  —  Admin Help</b>\n"
+        f"🤖  <b>Media Indexer Bot v6.4  —  Admin Help</b>\n"
         f"{_CMD_SEP}\n"
         f"/status               — Runtime stats\n"
         f"/flush                — Force-process all pending batches now\n"
@@ -3124,14 +3256,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/testdeletemessage    — Preview the file-delivery deletion notice\n"
         f"/help                 — This message\n\n"
         f"{_CMD_SEP}\n"
-        f"🧠  <b>v6.3 Smart Behaviour</b>\n"
+        f"🧠  <b>v6.4 Smart Behaviour</b>\n"
         f"• 1 post per movie — qualities as sorted buttons (4K first)\n"
         f"• .zip.001 / .part01.rar uploads trigger index posts ✅\n"
         f"• <b>Closed topics supported</b> — bot reopens, posts, re-closes\n"
         f"  (requires bot to be admin with 'Manage Topics' permission)\n"
         f"• New joiners get a welcome + deep-link into topic #{CFG.SEARCH_SHOWS_HERE}\n"
         f"• Private uploads from admins generate GPLinks + deep links\n"
-        f"• <b>/makepost series posts now support multiple seasons</b> —\n"
+        f"• <b>/makepost now asks for a poster image</b> right after you pick\n"
+        f"  Movie/Series, before the title — it's attached to the final post\n"
+        f"  (and its ALL_ADDED_SHOWS mirror) as the photo, with the post text\n"
+        f"  as the caption. Skippable.\n"
+        f"• <b>/makepost posts are now labelled</b> — Title: / Languages: /\n"
+        f"  Quality: (or Seasons: for series) each on their own line\n"
+        f"• <b>/makepost series posts support multiple seasons</b> —\n"
         f"  send total seasons like <code>S01, S02, S03</code>, upload each\n"
         f"  season's episodes, tap Upload Complete — buttons come out as\n"
         f"  <code>S01</code> / <code>S02</code> / … / <code>ALL SEASONS</code>\n"
@@ -3280,7 +3418,7 @@ async def on_startup(tg_app: Application) -> None:
         )
 
     log.info("══════════════════════════════════════════════")
-    log.info("  Media Indexer Bot v6.3  —  starting up")
+    log.info("  Media Indexer Bot v6.4  —  starting up")
     log.info(f"  Group:       {CFG.GROUP_CHAT_ID}")
     log.info(f"  IndexTopic:  {CFG.ALL_ADDED_SHOWS}  (SEARCH ALL ADDED SHOWS — closed topic, auto reopen/close)")
     log.info(f"  ChatTopic:   {CFG.SEARCH_SHOWS_HERE}  (welcome deep-link target)")
@@ -3290,7 +3428,7 @@ async def on_startup(tg_app: Application) -> None:
     log.info(f"  SeenTTL:     {CFG.SEEN_TTL_SEC}s")
     log.info(f"  DeleteDelay: {CFG.DELETE_DELAY_SEC}s")
     log.info("  Token:       ***REDACTED***")
-    log.info("  Mode:        v6.3 (self-destructing deliveries · multi-season /makepost · auto cross-post · file/text routing fix · closed-topic support · admin-only commands)")
+    log.info("  Mode:        v6.4 (poster support + labelled post text · self-destructing deliveries · multi-season /makepost · auto cross-post · closed-topic support · admin-only commands)")
     log.info("══════════════════════════════════════════════")
 
     asyncio.create_task(flush_loop(tg_app), name="flush_loop")
@@ -3346,11 +3484,11 @@ def main() -> None:
     application.add_handler(CommandHandler("help",              cmd_help))
 
     log.info("Bot polling started (drop_pending_updates=True)")
-    application.run_polling(
+    application.run_polling(        
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
 
 
 if __name__ == "__main__":
-    main()
+    main()                                                                                                                                                                  
